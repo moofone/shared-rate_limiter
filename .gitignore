@@ -1,0 +1,16 @@
+/target
+/spec
+/sprints
+
+.DS_Store
+.env
+.env.*
+.idea/
+.vscode/
+*.log
+*.tmp
+*.swp
+lcov.info
+coverage/
+*.profraw
+*.profdata

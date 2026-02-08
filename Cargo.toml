@@ -1,0 +1,15 @@
+[package]
+name = "shared-rate_limiter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kameo = { version = "0.19.2", optional = true, default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread", "time"] }
+
+[features]
+default = []
+# Optional actor wrapper and message types for kameo integration.
+kameo = ["dep:kameo"]
