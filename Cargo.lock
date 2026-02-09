@@ -198,7 +198,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "kameo"
 version = "0.19.2"
-source = "git+https://github.com/moofone/kameo?rev=ee74f3e4e21efe4f456e6eeb1f7e68cb24322186#ee74f3e4e21efe4f456e6eeb1f7e68cb24322186"
+source = "git+https://github.com/moofone/kameo?branch=main#ee74f3e4e21efe4f456e6eeb1f7e68cb24322186"
 dependencies = [
  "bitflags",
  "blake3",
