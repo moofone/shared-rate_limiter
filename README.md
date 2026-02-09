@@ -20,3 +20,10 @@
 ## More
 
 - Architecture notes: `docs/architecture/architecture.md`
+
+## License
+
+Licensed under either of:
+
+- Apache License, Version 2.0
+- MIT license
