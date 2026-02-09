@@ -369,6 +369,7 @@ mod tests {
 
         // Lookup finds the singleton.
         let found = ActorRef::<RateLimiterActor>::lookup(NAME)
+            .await
             .unwrap()
             .expect("registered actor should be discoverable");
         assert_eq!(found.id(), actor.id());
