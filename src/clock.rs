@@ -49,7 +49,7 @@ impl ManualClock {
 
     /// Advances time by `delta`.
     pub fn advance(&mut self, delta: Duration) {
-        self.now += delta;
+        self.now = self.now.saturating_add(delta);
     }
 
     /// Sets time to an absolute value.

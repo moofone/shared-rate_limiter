@@ -45,7 +45,7 @@ impl FixedWindowState {
             return;
         }
 
-        let end = self.window_start + window;
+        let end = self.window_start.saturating_add(window);
         if now >= end {
             self.window_start = window_start_for(now, window);
             self.spent = 0;
@@ -54,7 +54,7 @@ impl FixedWindowState {
     }
 
     fn retry_after_for_window(&self, now: Duration, window: Duration) -> Duration {
-        let end = self.window_start + window;
+        let end = self.window_start.saturating_add(window);
         end.saturating_sub(now)
     }
 }
@@ -134,6 +134,14 @@ impl BucketState {
                 }
 
                 let cost_u32 = cost.get();
+                if cost_u32 > max_per_window {
+                    return Err(BucketDeny {
+                        deny: Deny {
+                            retry_after: Duration::MAX,
+                        },
+                        reason: BucketDenyReason::Unachievable,
+                    });
+                }
                 let in_use = s.spent.saturating_add(s.reserved);
                 let available = max_per_window.saturating_sub(in_use);
                 if cost_u32 > available {
@@ -147,7 +155,7 @@ impl BucketState {
 
                 s.reserved = s.reserved.saturating_add(cost_u32);
 
-                let deadline = s.window_start + window;
+                let deadline = s.window_start.saturating_add(window);
                 Ok(Permit {
                     key,
                     cost,
@@ -255,7 +263,7 @@ impl BucketState {
                 scope: Scope::Key,
                 ..
             } => {
-                self.apply_blocked_until(now + retry_after);
+                self.apply_blocked_until(now.saturating_add(retry_after));
             }
             Outcome::RateLimitedFeedback {
                 scope: Scope::Global,
@@ -453,5 +461,20 @@ mod tests {
             .unwrap_err();
         assert_eq!(d.reason, BucketDenyReason::BlockedUntil);
         assert_eq!(d.deny.retry_after, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn fixed_window_cost_above_max_is_permanent_deny() {
+        let cfg = AlgorithmConfig::FixedWindow {
+            max_per_window: 5,
+            window: Duration::from_secs(10),
+        };
+        let mut b = BucketState::new(Duration::from_secs(0), cfg);
+
+        let d = b
+            .try_reserve(1, cfg, Cost::new(6).unwrap(), Duration::from_secs(0))
+            .unwrap_err();
+        assert_eq!(d.reason, BucketDenyReason::Unachievable);
+        assert_eq!(d.deny.retry_after, Duration::MAX);
     }
 }

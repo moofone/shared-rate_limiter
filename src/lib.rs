@@ -58,7 +58,9 @@
 //! use shared_rate_limiter::{Config, RateLimiter};
 //!
 //! let mut limiter = RateLimiter::new(Config::token_bucket(10, 10));
-//! limiter.update_config(Config::token_bucket(20, 10), Duration::from_secs(0));
+//! limiter
+//!     .update_config(Config::token_bucket(20, 10), Duration::from_secs(0))
+//!     .unwrap();
 //! ```
 //!
 //! # Example
@@ -111,11 +113,13 @@ mod token_bucket;
 pub mod types;
 
 mod bucket;
+mod hash;
 mod limiter;
 
 pub use config::{AlgorithmConfig, Config, ConfigError, OverflowPolicy};
 pub use feedback::{Feedback, FeedbackScope, RateLimitFeedback};
 pub use limiter::RateLimiter;
+pub use limiter::{UpdateConfigError, UpdateConfigErrorKind};
 pub use observer::{DenyEvent, DenyReason, FeedbackEvent, LimiterObserver};
 pub use slow_start::SlowStart;
 pub use types::{Cost, Deny, Key, Outcome, Permit, Scope};

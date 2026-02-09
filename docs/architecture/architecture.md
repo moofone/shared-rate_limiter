@@ -101,7 +101,8 @@ Instead:
 - Repeated feedback cannot shorten an existing backoff window, preventing oscillations from alternating signals.
 
 If you want adaptive tuning, implement it in the provider adapter layer by adjusting `Config` over time
-via `RateLimiter::update_config(new_cfg, now)` using a stable controller (with caps, smoothing, and hysteresis).
+via `RateLimiter::update_config(new_cfg, now)` (handling the `Result`) using a stable controller
+(with caps, smoothing, and hysteresis).
 
 ## Slow Start
 
@@ -195,4 +196,3 @@ These are examples of how an external REST/WS adapter can map provider-specific 
 
 - `Feedback` (retry-after + scope)
 - `Outcome::RateLimitedFeedback` when finalizing a permit
-
