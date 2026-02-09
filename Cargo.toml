@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 # Use the upstream GitHub repo (no local path refs).
-kameo = { git = "https://github.com/moofone/kameo", branch = "main", optional = true, default-features = false }
+kameo = { git = "https://github.com/moofone/kameo", rev = "ee74f3e4e21efe4f456e6eeb1f7e68cb24322186", optional = true, default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread", "time"] }

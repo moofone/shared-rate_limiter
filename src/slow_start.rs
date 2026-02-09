@@ -51,7 +51,8 @@ pub(crate) fn effective_u64(max: u64, slow: SlowStart, started_at: Duration, now
     let max_u128 = max as u128;
     let e = elapsed.as_nanos();
     let r = slow.ramp.as_nanos();
-    ((max_u128 * e) / r).min(u64::MAX as u128) as u64
+    let scaled = max_u128.saturating_mul(e) / r;
+    scaled.min(u64::MAX as u128) as u64
 }
 
 pub(crate) fn retry_after_for_cost(
@@ -106,13 +107,17 @@ pub(crate) fn retry_after_for_cost_u64(
     let r = slow.ramp.as_nanos();
     let max = max as u128;
     let cost = cost as u128;
-    let needed = (cost * r).div_ceil(max);
+    let needed = cost.saturating_mul(r).div_ceil(max);
     let needed_dur = duration_from_nanos(needed);
     needed_dur.saturating_sub(elapsed)
 }
 
 fn duration_from_nanos(n: u128) -> Duration {
-    let secs = (n / 1_000_000_000) as u64;
+    let secs_u128 = n / 1_000_000_000;
+    if secs_u128 > u64::MAX as u128 {
+        return Duration::MAX;
+    }
+    let secs = secs_u128 as u64;
     let nanos = (n % 1_000_000_000) as u32;
     Duration::new(secs, nanos)
 }

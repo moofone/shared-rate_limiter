@@ -81,6 +81,9 @@ impl Config {
     }
 
     /// Token-bucket / credit-pool limiter configuration.
+    ///
+    /// `max_keys` defaults to `None` (unbounded distinct keys). Use [`Config::with_max_keys`] to
+    /// apply a bound.
     pub fn token_bucket(capacity: u64, refill_per_sec: u64) -> Self {
         Self {
             algorithm: AlgorithmConfig::TokenBucket {
@@ -91,6 +94,15 @@ impl Config {
             overflow_policy: OverflowPolicy::DenyNewKey,
             slow_start: None,
         }
+    }
+
+    /// Set the maximum number of distinct tracked keys.
+    ///
+    /// When set, acquiring a previously unseen key past this bound will be denied (or evict an
+    /// existing key) depending on the configured [`OverflowPolicy`].
+    pub fn with_max_keys(mut self, max_keys: Option<usize>) -> Self {
+        self.max_keys = max_keys;
+        self
     }
 
     /// Enable slow-start ramping.

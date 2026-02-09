@@ -139,9 +139,13 @@ impl RateLimiter {
         now: Duration,
     ) {
         let remap = feedback.bucket_remap();
-        if let Some(new_bucket) = remap {
-            self.apply_route_remap(route_key, new_bucket);
-        }
+        let applied_remap = remap.and_then(|new_bucket| {
+            if self.apply_route_remap(route_key, new_bucket) {
+                Some(new_bucket)
+            } else {
+                None
+            }
+        });
 
         let bucket_key = self.resolve_bucket_key(route_key);
 
@@ -151,7 +155,7 @@ impl RateLimiter {
         {
             backoff = backoff.max(reset_after);
         }
-        let until = now + backoff;
+        let until = now.saturating_add(backoff);
 
         match feedback.scope() {
             FeedbackScope::Global => {
@@ -174,7 +178,7 @@ impl RateLimiter {
             now,
             retry_after: backoff,
             scope: feedback.scope(),
-            bucket_remap: remap,
+            bucket_remap: applied_remap,
         });
     }
 
@@ -188,7 +192,7 @@ impl RateLimiter {
             ..
         } = &outcome
         {
-            let until = now + *retry_after;
+            let until = now.saturating_add(*retry_after);
             self.global_blocked_until = Some(
                 self.global_blocked_until
                     .map_or(until, |cur| cur.max(until)),
@@ -229,16 +233,17 @@ impl RateLimiter {
         self.route_map.get(&route_key).copied().unwrap_or(route_key)
     }
 
-    fn apply_route_remap(&mut self, route_key: Key, new_bucket: Key) {
+    fn apply_route_remap(&mut self, route_key: Key, new_bucket: Key) -> bool {
         // Best-effort bounding: reuse `max_keys` if configured.
         if let Some(max_keys) = self.cfg.max_keys
             && self.route_map.len() >= max_keys
             && !self.route_map.contains_key(&route_key)
         {
             // If the mapping table is full, refuse to grow it; the caller can still pass the bucket key directly.
-            return;
+            return false;
         }
         self.route_map.insert(route_key, new_bucket);
+        true
     }
 
     fn ensure_bucket_capacity(
@@ -274,26 +279,35 @@ impl RateLimiter {
             }
             OverflowPolicy::EvictOldestKey => {
                 // Evict oldest evictable (no outstanding reservations).
-                if let Some(old) = self.fifo.pop_front() {
-                    if let Some(st) = self.buckets.get(&old)
-                        && st.has_outstanding()
-                    {
-                        // Can't evict; keep it and deny.
-                        self.fifo.push_front(old);
-                        let deny = Deny { retry_after };
-                        self.observer.on_deny(DenyEvent {
-                            route_key,
-                            bucket_key,
-                            cost,
-                            now,
-                            deny,
-                            reason: DenyReason::KeyCardinalityBound,
-                        });
-                        return Err(deny);
+                let mut evict_idx = None;
+                for (idx, k) in self.fifo.iter().enumerate() {
+                    match self.buckets.get(k) {
+                        Some(st) if st.has_outstanding() => {}
+                        Some(_) | None => {
+                            evict_idx = Some(idx);
+                            break;
+                        }
                     }
-                    self.buckets.remove(&old);
                 }
-                Ok(())
+
+                if let Some(idx) = evict_idx
+                    && let Some(old) = self.fifo.remove(idx)
+                {
+                    self.buckets.remove(&old);
+                    return Ok(());
+                }
+
+                // No evictable key found (all tracked keys have outstanding reservations).
+                let deny = Deny { retry_after };
+                self.observer.on_deny(DenyEvent {
+                    route_key,
+                    bucket_key,
+                    cost,
+                    now,
+                    deny,
+                    reason: DenyReason::KeyCardinalityBound,
+                });
+                Err(deny)
             }
         }
     }
@@ -435,6 +449,7 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
@@ -465,6 +480,23 @@ mod tests {
 
         fn on_feedback(&self, _ev: FeedbackEvent) {
             self.feedbacks.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingObserver {
+        feedbacks: Arc<Mutex<Vec<FeedbackEvent>>>,
+    }
+
+    impl RecordingObserver {
+        fn new(feedbacks: Arc<Mutex<Vec<FeedbackEvent>>>) -> Self {
+            Self { feedbacks }
+        }
+    }
+
+    impl LimiterObserver for RecordingObserver {
+        fn on_feedback(&self, ev: FeedbackEvent) {
+            self.feedbacks.lock().unwrap().push(ev);
         }
     }
 
@@ -600,6 +632,27 @@ mod tests {
     }
 
     #[test]
+    fn eviction_skips_keys_with_outstanding_reservations() {
+        let cfg = Config::fixed_window_bounded(10, Duration::from_secs(10), Some(2))
+            .unwrap()
+            .with_overflow_policy(OverflowPolicy::EvictOldestKey);
+        let mut rl = RateLimiter::new(cfg);
+        let now = Duration::from_secs(0);
+
+        // Oldest key has an outstanding reservation and is not evictable.
+        let _p1 = rl.try_acquire(1, Cost::ONE, now).unwrap();
+
+        // Next key is evictable (no outstanding after commit).
+        let p2 = rl.try_acquire(2, Cost::ONE, now).unwrap();
+        rl.commit(p2, Outcome::Confirmed, now);
+
+        // When inserting a third key, the limiter should evict key=2 (oldest evictable),
+        // rather than denying due to key=1 being protected.
+        let p3 = rl.try_acquire(3, Cost::ONE, now).unwrap();
+        rl.commit(p3, Outcome::Confirmed, now);
+    }
+
+    #[test]
     fn observer_hooks_fire_once_for_deny_and_feedback() {
         let mut rl = RateLimiter::new(cfg(1, Duration::from_secs(10)));
         let denies = Arc::new(AtomicU32::new(0));
@@ -704,5 +757,123 @@ mod tests {
         rl.update_config(Config::token_bucket(10, 100), now0);
         let d2 = rl.try_acquire(1, Cost::ONE, now0).unwrap_err();
         assert_eq!(d2.retry_after, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn token_bucket_respects_max_keys_when_set() {
+        let cfg = Config::token_bucket(10, 10).with_max_keys(Some(1));
+        let mut rl = RateLimiter::new(cfg);
+        let now = Duration::from_secs(0);
+
+        let p1 = rl.try_acquire(1, Cost::ONE, now).unwrap();
+        rl.commit(p1, Outcome::Confirmed, now);
+
+        let d = rl.try_acquire(2, Cost::ONE, now).unwrap_err();
+        assert_eq!(d.retry_after, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn feedback_bucket_remap_event_reports_only_applied_remaps() {
+        let cfg = Config::fixed_window_bounded(1, Duration::from_secs(10), Some(1)).unwrap();
+        let mut rl = RateLimiter::new(cfg);
+
+        let events = Arc::new(Mutex::new(Vec::<FeedbackEvent>::new()));
+        rl.set_observer(Box::new(RecordingObserver::new(Arc::clone(&events))));
+
+        // First remap fits within the route_map cap (max_keys=1).
+        rl.apply_feedback(
+            1,
+            &Feedback {
+                retry_after: Duration::ZERO,
+                scope: FeedbackScope::Route,
+                remaining: None,
+                reset_after: None,
+                bucket_remap: Some(10),
+            },
+            Duration::from_secs(0),
+        );
+
+        // Second remap is refused due to route_map being full.
+        rl.apply_feedback(
+            2,
+            &Feedback {
+                retry_after: Duration::ZERO,
+                scope: FeedbackScope::Route,
+                remaining: None,
+                reset_after: None,
+                bucket_remap: Some(20),
+            },
+            Duration::from_secs(0),
+        );
+
+        let evs = events.lock().unwrap();
+        assert_eq!(evs.len(), 2);
+
+        assert_eq!(evs[0].route_key, 1);
+        assert_eq!(evs[0].bucket_key, 10);
+        assert_eq!(evs[0].bucket_remap, Some(10));
+
+        assert_eq!(evs[1].route_key, 2);
+        assert_eq!(evs[1].bucket_key, 2);
+        assert_eq!(evs[1].bucket_remap, None);
+    }
+
+    #[test]
+    fn apply_feedback_duration_max_saturates_and_does_not_panic() {
+        let mut rl = RateLimiter::new(cfg(10, Duration::from_secs(10)));
+        rl.apply_feedback(
+            1,
+            &Feedback::new(Duration::MAX, FeedbackScope::Global),
+            Duration::from_secs(1),
+        );
+
+        let d = rl
+            .try_acquire(2, Cost::ONE, Duration::from_secs(2))
+            .unwrap_err();
+        assert_eq!(d.retry_after, Duration::MAX - Duration::from_secs(2));
+    }
+
+    #[test]
+    fn outcome_global_feedback_duration_max_saturates_and_does_not_panic() {
+        let mut rl = RateLimiter::new(cfg(10, Duration::from_secs(10)));
+        let p = rl
+            .try_acquire(1, Cost::ONE, Duration::from_secs(0))
+            .unwrap();
+        rl.commit(
+            p,
+            Outcome::RateLimitedFeedback {
+                retry_after: Duration::MAX,
+                scope: Scope::Global,
+                bucket_hint: None,
+            },
+            Duration::from_secs(1),
+        );
+
+        let d = rl
+            .try_acquire(2, Cost::ONE, Duration::from_secs(2))
+            .unwrap_err();
+        assert_eq!(d.retry_after, Duration::MAX - Duration::from_secs(2));
+    }
+
+    #[test]
+    fn outcome_key_feedback_duration_max_saturates_and_does_not_panic() {
+        let mut rl = RateLimiter::new(cfg(10, Duration::from_secs(10)));
+        let p = rl
+            .try_acquire(1, Cost::ONE, Duration::from_secs(0))
+            .unwrap();
+        rl.commit(
+            p,
+            Outcome::RateLimitedFeedback {
+                retry_after: Duration::MAX,
+                scope: Scope::Key,
+                bucket_hint: None,
+            },
+            Duration::from_secs(1),
+        );
+
+        let d = rl
+            .try_acquire(1, Cost::ONE, Duration::from_secs(2))
+            .unwrap_err();
+        assert_eq!(d.retry_after, Duration::MAX - Duration::from_secs(2));
     }
 }
