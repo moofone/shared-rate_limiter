@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use kameo::actor::{Actor, ActorRef, Spawn};
+use kameo::actor::{Actor, ActorRef, ActorRegistration, Spawn};
 use kameo::error::RegistryError;
 use kameo::message::{Context, Message};
 
@@ -64,6 +64,13 @@ pub struct RateLimiterActor {
     limiter: RateLimiter,
 }
 
+// kameo's registry APIs now route through `ActorRegistration`; we only need local registration.
+impl ActorRegistration for RateLimiterActor {
+    fn register_actor(actor_ref: &ActorRef<Self>, name: &str) -> Result<(), RegistryError> {
+        actor_ref.register_local(name.to_string())
+    }
+}
+
 impl RateLimiterActor {
     /// Construct a new actor from an existing limiter.
     ///
@@ -105,7 +112,7 @@ impl RateLimiterActor {
             }
         }
 
-        if let Some(existing) = ActorRef::<Self>::lookup(name.as_str())? {
+        if let Some(existing) = ActorRef::<Self>::lookup(name.as_str()).await? {
             return Ok(existing);
         }
 
@@ -130,7 +137,7 @@ impl RateLimiterActor {
         match startup {
             StartupStatus::Ok => {}
             StartupStatus::NameAlreadyRegistered => {
-                if let Some(existing) = ActorRef::<Self>::lookup(name.as_str())? {
+                if let Some(existing) = ActorRef::<Self>::lookup(name.as_str()).await? {
                     return Ok(existing);
                 }
                 return Err(SingletonError::StartupFailed(
@@ -141,7 +148,7 @@ impl RateLimiterActor {
         }
 
         // If startup failed because of a concurrent initializer, prefer the registered actor.
-        if let Some(existing) = ActorRef::<Self>::lookup(name.as_str())? {
+        if let Some(existing) = ActorRef::<Self>::lookup(name.as_str()).await? {
             return Ok(existing);
         }
 
@@ -362,6 +369,7 @@ mod tests {
 
         // Lookup finds the singleton.
         let found = ActorRef::<RateLimiterActor>::lookup(NAME)
+            .await
             .unwrap()
             .expect("registered actor should be discoverable");
         assert_eq!(found.id(), actor.id());
