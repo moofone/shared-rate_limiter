@@ -1,13 +1,56 @@
+use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::time::Duration;
 
 use crate::bucket::{BucketDenyReason, BucketState};
 use crate::config::{AlgorithmConfig, Config, OverflowPolicy};
 use crate::feedback::{FeedbackScope, RateLimitFeedback};
+use crate::hash::HashMap;
 use crate::observer::{DenyEvent, DenyReason, FeedbackEvent, LimiterObserver, NoopObserver};
 use crate::slow_start;
 use crate::types::{Cost, Deny, Key, Outcome, Permit, Scope};
+
+/// Reason an [`update_config`](RateLimiter::update_config) call was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateConfigErrorKind {
+    /// The algorithm kind changed (fixed-window <-> token-bucket) while permits were outstanding.
+    AlgorithmChanged,
+    /// The fixed-window `window` size changed while permits were outstanding.
+    FixedWindowWindowChanged,
+}
+
+/// Error returned by [`RateLimiter::update_config`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateConfigError {
+    kind: UpdateConfigErrorKind,
+}
+
+impl UpdateConfigError {
+    /// Error classification.
+    pub fn kind(self) -> UpdateConfigErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for UpdateConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            UpdateConfigErrorKind::AlgorithmChanged => {
+                write!(
+                    f,
+                    "update_config rejected: algorithm kind changed while permits were outstanding"
+                )
+            }
+            UpdateConfigErrorKind::FixedWindowWindowChanged => write!(
+                f,
+                "update_config rejected: fixed-window window changed while permits were outstanding"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UpdateConfigError {}
 
 /// A protocol-agnostic, synchronous rate limiter.
 ///
@@ -40,11 +83,59 @@ impl RateLimiter {
         Self {
             cfg,
             started_at,
-            route_map: HashMap::new(),
-            buckets: HashMap::new(),
+            route_map: HashMap::default(),
+            buckets: HashMap::default(),
             fifo: VecDeque::new(),
             global_blocked_until: None,
             observer: Box::new(NoopObserver),
+        }
+    }
+
+    /// Apply a runtime configuration update deterministically.
+    ///
+    /// This rejects algorithm-kind changes (and fixed-window `window` changes) while there are
+    /// outstanding permits, because late finalization would otherwise become a silent no-op.
+    pub fn update_config(
+        &mut self,
+        new_cfg: Config,
+        now: Duration,
+    ) -> Result<(), UpdateConfigError> {
+        let old_algo = self.cfg.algorithm;
+        let new_algo = new_cfg.algorithm;
+
+        let requires_no_outstanding = match (old_algo, new_algo) {
+            (
+                AlgorithmConfig::FixedWindow { window: old_w, .. },
+                AlgorithmConfig::FixedWindow { window: new_w, .. },
+            ) if old_w != new_w => Some(UpdateConfigErrorKind::FixedWindowWindowChanged),
+            (AlgorithmConfig::FixedWindow { .. }, AlgorithmConfig::TokenBucket { .. })
+            | (AlgorithmConfig::TokenBucket { .. }, AlgorithmConfig::FixedWindow { .. }) => {
+                Some(UpdateConfigErrorKind::AlgorithmChanged)
+            }
+            _ => None,
+        };
+
+        if let Some(kind) = requires_no_outstanding {
+            let has_outstanding = self.buckets.values().any(|b| b.has_outstanding());
+            if has_outstanding {
+                return Err(UpdateConfigError { kind });
+            }
+        }
+
+        self.update_config_unchecked(new_cfg, now);
+        Ok(())
+    }
+
+    /// Apply a runtime configuration update without enforcing outstanding-permit safety checks.
+    ///
+    /// Prefer [`RateLimiter::update_config`]. This exists for advanced callers that can prove
+    /// they will finalize all permits before changing algorithm kind or fixed-window window size.
+    pub fn update_config_unchecked(&mut self, new_cfg: Config, now: Duration) {
+        let old_algo = self.cfg.algorithm;
+        let new_algo = new_cfg.algorithm;
+        self.cfg = new_cfg;
+        for b in self.buckets.values_mut() {
+            b.on_update(old_algo, new_algo, now);
         }
     }
 
@@ -208,19 +299,6 @@ impl RateLimiter {
     pub fn refund(&mut self, permit: Permit, now: Duration) {
         if let Some(bucket) = self.buckets.get_mut(&permit.key) {
             bucket.refund(permit, now, self.cfg.algorithm);
-        }
-    }
-
-    /// Apply a runtime configuration update deterministically.
-    ///
-    /// This does not invalidate outstanding permits, but if the algorithm kind changes while permits are outstanding,
-    /// finalization may be treated as a no-op (debug asserted) to preserve safety.
-    pub fn update_config(&mut self, new_cfg: Config, now: Duration) {
-        let old_algo = self.cfg.algorithm;
-        let new_algo = new_cfg.algorithm;
-        self.cfg = new_cfg;
-        for b in self.buckets.values_mut() {
-            b.on_update(old_algo, new_algo, now);
         }
     }
 
@@ -730,7 +808,7 @@ mod tests {
         let mut rl = RateLimiter::new(Config::token_bucket(10, 0));
         let p = rl.try_acquire(1, cost, now0).unwrap();
         rl.commit(p, Outcome::SentNoConfirm, now0); // credits: 5
-        rl.update_config(Config::token_bucket(20, 0), now0); // credits: 15
+        rl.update_config(Config::token_bucket(20, 0), now0).unwrap(); // credits: 15
         for _ in 0..3 {
             let p = rl.try_acquire(1, cost, now0).unwrap();
             rl.commit(p, Outcome::SentNoConfirm, now0);
@@ -741,7 +819,7 @@ mod tests {
         let mut rl = RateLimiter::new(Config::token_bucket(20, 0));
         let p = rl.try_acquire(1, cost, now0).unwrap();
         rl.commit(p, Outcome::SentNoConfirm, now0); // credits: 15
-        rl.update_config(Config::token_bucket(10, 0), now0); // credits clamped to 10
+        rl.update_config(Config::token_bucket(10, 0), now0).unwrap(); // credits clamped to 10
         for _ in 0..2 {
             let p = rl.try_acquire(1, cost, now0).unwrap();
             rl.commit(p, Outcome::SentNoConfirm, now0);
@@ -754,9 +832,54 @@ mod tests {
         rl.commit(p, Outcome::SentNoConfirm, now0);
         let d1 = rl.try_acquire(1, Cost::ONE, now0).unwrap_err();
         assert_eq!(d1.retry_after, Duration::from_millis(100));
-        rl.update_config(Config::token_bucket(10, 100), now0);
+        rl.update_config(Config::token_bucket(10, 100), now0)
+            .unwrap();
         let d2 = rl.try_acquire(1, Cost::ONE, now0).unwrap_err();
         assert_eq!(d2.retry_after, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn update_config_rejects_algorithm_change_with_outstanding_permits() {
+        let mut rl = RateLimiter::new(cfg(1, Duration::from_secs(1)));
+        let _p = rl
+            .try_acquire(1, Cost::ONE, Duration::from_secs(0))
+            .unwrap();
+
+        let err = rl
+            .update_config(Config::token_bucket(10, 10), Duration::from_secs(0))
+            .unwrap_err();
+        assert_eq!(err.kind(), UpdateConfigErrorKind::AlgorithmChanged);
+    }
+
+    #[test]
+    fn update_config_rejects_fixed_window_window_change_with_outstanding_permits() {
+        let mut rl = RateLimiter::new(cfg(1, Duration::from_secs(1)));
+        let _p = rl
+            .try_acquire(1, Cost::ONE, Duration::from_secs(0))
+            .unwrap();
+
+        let err = rl
+            .update_config(
+                Config::fixed_window(1, Duration::from_secs(2)).unwrap(),
+                Duration::from_secs(0),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), UpdateConfigErrorKind::FixedWindowWindowChanged);
+    }
+
+    #[test]
+    fn update_config_allows_fixed_window_window_change_without_outstanding_permits() {
+        let mut rl = RateLimiter::new(cfg(1, Duration::from_secs(1)));
+        let p = rl
+            .try_acquire(1, Cost::ONE, Duration::from_secs(0))
+            .unwrap();
+        rl.commit(p, Outcome::Confirmed, Duration::from_secs(0));
+
+        rl.update_config(
+            Config::fixed_window(1, Duration::from_secs(2)).unwrap(),
+            Duration::from_secs(0),
+        )
+        .unwrap();
     }
 
     #[test]

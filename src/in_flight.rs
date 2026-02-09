@@ -1,8 +1,9 @@
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::hash::Hash;
 use std::time::Duration;
 
+use crate::hash::HashMap;
 use crate::types::{Outcome, Permit};
 
 /// Result of [`InFlightTable::begin`].
@@ -103,7 +104,7 @@ where
         Self {
             max_in_flight,
             seq: 0,
-            map: HashMap::new(),
+            map: HashMap::default(),
             heap: BinaryHeap::new(),
         }
     }
