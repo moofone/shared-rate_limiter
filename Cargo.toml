@@ -9,7 +9,7 @@ repository = "https://github.com/moofone/shared-rate_limiter"
 readme = "README.md"
 
 [dependencies]
-kameo = { version = "0.19.2", optional = true, default-features = false }
+kameo = { git = "https://github.com/moofone/kameo", features = ["remote"], optional = true }
 ahash = { version = "0.8.11", optional = true }
 
 [dev-dependencies]
