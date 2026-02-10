@@ -105,7 +105,7 @@ impl RateLimiterActor {
             }
         }
 
-        if let Some(existing) = ActorRef::<Self>::lookup(name.as_str())? {
+        if let Some(existing) = ActorRef::<Self>::lookup(name.as_str()).await? {
             return Ok(existing);
         }
 
@@ -130,7 +130,7 @@ impl RateLimiterActor {
         match startup {
             StartupStatus::Ok => {}
             StartupStatus::NameAlreadyRegistered => {
-                if let Some(existing) = ActorRef::<Self>::lookup(name.as_str())? {
+                if let Some(existing) = ActorRef::<Self>::lookup(name.as_str()).await? {
                     return Ok(existing);
                 }
                 return Err(SingletonError::StartupFailed(
@@ -141,7 +141,7 @@ impl RateLimiterActor {
         }
 
         // If startup failed because of a concurrent initializer, prefer the registered actor.
-        if let Some(existing) = ActorRef::<Self>::lookup(name.as_str())? {
+        if let Some(existing) = ActorRef::<Self>::lookup(name.as_str()).await? {
             return Ok(existing);
         }
 
@@ -195,7 +195,11 @@ impl Actor for RateLimiterActor {
         }
 
         // Register on startup to support ActorRef::lookup(name).
-        actor_ref.register(args.name.clone())?;
+        //
+        // `kameo::actor::ActorRef::register` now requires the actor implement
+        // `ActorRegistration` (primarily for distributed actors). This crate only needs
+        // local process registry lookup, so we register locally.
+        actor_ref.register_local(args.name.clone())?;
         Ok(args)
     }
 }
@@ -362,6 +366,7 @@ mod tests {
 
         // Lookup finds the singleton.
         let found = ActorRef::<RateLimiterActor>::lookup(NAME)
+            .await
             .unwrap()
             .expect("registered actor should be discoverable");
         assert_eq!(found.id(), actor.id());
