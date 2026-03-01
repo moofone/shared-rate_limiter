@@ -3,13 +3,12 @@ name = "shared-rate_limiter"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
-description = "Protocol-agnostic, deterministic, synchronous rate limiter core with two-phase permits, feedback backoff, and optional kameo integration."
+description = "Protocol-agnostic, deterministic, synchronous rate limiter core with two-phase permits and feedback backoff."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/moofone/shared-rate_limiter"
 readme = "README.md"
 
 [dependencies]
-kameo = { git = "https://github.com/moofone/kameo", features = ["remote"], optional = true }
 ahash = { version = "0.8.11", optional = true }
 heed = "0.20"
 rkyv = { version = "0.8", features = ["std", "bytecheck"] }
@@ -19,7 +18,4 @@ tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread", "time"] }
 
 [features]
 default = []
-# Optional actor wrapper and message types for kameo integration.
-kameo = ["dep:kameo"]
-# Use a faster hasher for internal `HashMap`s (hot path).
 fast-hash = ["dep:ahash"]

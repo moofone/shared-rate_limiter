@@ -39,6 +39,3 @@ jobs:
 
       - name: Test (default)
         run: cargo test
-
-      - name: Test (kameo)
-        run: cargo test --features kameo

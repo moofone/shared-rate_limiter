@@ -8,7 +8,6 @@
 - Support both fixed-window limits and token-bucket (credit pool + refill) limits.
 - Controlled backoff from server feedback (429-style) without requiring async/threads inside the core.
 - Bounded memory for key tracking and in-flight dedup helpers.
-- Optional kameo integration without making kameo a mandatory dependency.
 
 ## Non-Goals
 
@@ -41,7 +40,7 @@ The algorithm kind is stored in `AlgorithmConfig` and is used by each tracked bu
 `RateLimiter` is intentionally single-owner:
 
 - Core methods take `&mut self` to keep the hot path simple and fast.
-- Concurrency is achieved by putting the limiter behind an actor (kameo wrapper) or external sync chosen by the application.
+- Concurrency is achieved by putting the limiter behind an actor or external sync chosen by the application.
 
 Primary operations:
 
@@ -123,7 +122,7 @@ The limiter can be configured with `max_keys` and an `OverflowPolicy`:
 
 Route-to-bucket remapping (from feedback) is stored in a bounded `route_map` (best-effort bounded by `max_keys`).
 
-## In-Flight Dedup Building Blocks (Non-kameo)
+## In-Flight Dedup Building Blocks
 
 This crate provides primitives for deduplicating duplicate request ids and attaching permits through completion:
 
@@ -157,32 +156,6 @@ The crate exposes `LimiterObserver` with:
 - `on_feedback(FeedbackEvent)`
 
 Applications can wire these to `tracing`, metrics, or structured logs without forcing a logging backend dependency.
-
-## Optional kameo Integration (feature = "kameo")
-
-The `kameo` feature provides a minimal actor wrapper: `RateLimiterActor`.
-
-### Registration and Lookup
-
-The actor requires a caller-provided name and registers itself during `on_start` so other components can do:
-
-- `ActorRef::<RateLimiterActor>::lookup("the_name")`
-
-The module also enforces a process-level singleton name (first name wins).
-
-### Messages
-
-The actor exposes protocol-agnostic messages:
-
-- `AcquirePermits { key, permits, now } -> Result<AcquiredPermits, Deny>`
-- `ApplyFeedback { route_key, feedback: Feedback, now } -> ()`
-- `FinalizePermit { permit, outcome, now } -> ()`
-
-This supports a clean shared-ws pattern:
-
-1. Ask for permits before sending.
-2. Tell the actor about feedback when you receive "too many requests" signals.
-3. Finalize permits when the outcome is known.
 
 ## Provider Examples (Protocol-Agnostic Inputs)
 

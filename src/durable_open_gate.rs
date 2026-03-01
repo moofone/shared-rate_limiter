@@ -209,10 +209,7 @@ impl DurableOpenGate {
             });
         }
 
-        let mut wtxn = match self.env.write_txn() {
-            Ok(txn) => txn,
-            Err(err) => return Err(err.into()),
-        };
+        let mut wtxn = self.env.write_txn()?;
         let persisted_lock_until = match self.read_lock_until_ms_rw(&wtxn) {
             Ok(value) => value,
             Err(err) => {
