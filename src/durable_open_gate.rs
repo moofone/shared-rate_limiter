@@ -1,8 +1,11 @@
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
+use std::io;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fs2::FileExt;
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
 use rkyv::{Archive, Deserialize, Serialize};
@@ -82,6 +85,10 @@ pub enum DurableOpenGateError {
     Encode(String),
     /// rkyv decode failure.
     Decode(String),
+    /// Another process already holds the gate lock.
+    AlreadyLocked,
+    /// Shared gate mutex is poisoned.
+    LockPoisoned,
 }
 
 impl fmt::Display for DurableOpenGateError {
@@ -92,6 +99,8 @@ impl fmt::Display for DurableOpenGateError {
             Self::Heed(err) => write!(f, "durable open gate LMDB error: {err}"),
             Self::Encode(err) => write!(f, "durable open gate encode error: {err}"),
             Self::Decode(err) => write!(f, "durable open gate decode error: {err}"),
+            Self::AlreadyLocked => write!(f, "durable open gate already locked"),
+            Self::LockPoisoned => write!(f, "durable open gate lock poisoned"),
         }
     }
 }
@@ -118,13 +127,38 @@ struct OpenGateRecordV1 {
     window_ms: u64,
 }
 
+struct FileLock {
+    _file: File,
+}
+
+impl FileLock {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        let lock_path = path.join(".open_gate.lock");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        file.try_lock_exclusive()?;
+        Ok(Self { _file: file })
+    }
+}
+
 /// Durable LMDB-backed gate that enforces at-most-one open grant per configured window.
 pub struct DurableOpenGate {
+    _file_lock: FileLock,
     env: Env,
     db: Database<Str, Bytes>,
     cfg: DurableOpenGateConfig,
     cached_lock_until_ms: u64,
     stats: OpenGateStats,
+}
+
+/// Shared wrapper with fail-closed lock contention behavior.
+#[derive(Clone, Debug)]
+pub struct SharedDurableOpenGate {
+    inner: Arc<Mutex<DurableOpenGate>>,
 }
 
 impl fmt::Debug for DurableOpenGate {
@@ -143,6 +177,14 @@ impl DurableOpenGate {
         path: impl AsRef<Path>,
         cfg: DurableOpenGateConfig,
     ) -> Result<Self, DurableOpenGateError> {
+        let file_lock = FileLock::acquire(path.as_ref()).map_err(|err| {
+            if err.kind() == io::ErrorKind::WouldBlock {
+                DurableOpenGateError::AlreadyLocked
+            } else {
+                DurableOpenGateError::Io(err)
+            }
+        })?;
+
         if cfg.window.is_zero() {
             return Err(DurableOpenGateError::InvalidConfig(
                 "window must be non-zero".to_string(),
@@ -169,6 +211,7 @@ impl DurableOpenGate {
         wtxn.commit()?;
 
         let mut gate = Self {
+            _file_lock: file_lock,
             env,
             db,
             cfg,
@@ -304,6 +347,47 @@ impl DurableOpenGate {
         let decoded = rkyv::from_bytes::<OpenGateRecordV1, rkyv::rancor::Error>(raw)
             .map_err(|err| DurableOpenGateError::Decode(err.to_string()))?;
         Ok(decoded.lock_until_ms)
+    }
+}
+
+impl SharedDurableOpenGate {
+    /// Opens a shared gate around a single durable gate instance.
+    pub fn open(
+        path: impl AsRef<Path>,
+        cfg: DurableOpenGateConfig,
+    ) -> Result<Self, DurableOpenGateError> {
+        DurableOpenGate::open(path, cfg).map(Self::new)
+    }
+
+    /// Wraps an existing durable gate.
+    pub fn new(inner: DurableOpenGate) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    /// Attempts acquire and fails closed on lock contention.
+    pub fn try_acquire_open_fail_closed(
+        &self,
+        now: Duration,
+    ) -> Result<OpenGateDecision, DurableOpenGateError> {
+        match self.inner.try_lock() {
+            Ok(mut guard) => guard.try_acquire_open(now),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(OpenGateDecision::Blocked {
+                lock_until: now,
+            }),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(DurableOpenGateError::LockPoisoned),
+        }
+    }
+
+    /// Returns stats if lock is immediately available.
+    pub fn stats(&self) -> Option<OpenGateStats> {
+        self.inner.try_lock().ok().map(|guard| guard.stats())
+    }
+
+    /// Returns the underlying shared handle for tests and integration wiring.
+    pub fn shared_inner(&self) -> Arc<Mutex<DurableOpenGate>> {
+        self.inner.clone()
     }
 }
 
