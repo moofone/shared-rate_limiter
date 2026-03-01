@@ -1,8 +1,11 @@
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
+use std::io;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fs2::FileExt;
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
 use rkyv::{Archive, Deserialize, Serialize};
@@ -82,6 +85,10 @@ pub enum DurableOpenGateError {
     Encode(String),
     /// rkyv decode failure.
     Decode(String),
+    /// Another process already holds the gate lock.
+    AlreadyLocked,
+    /// Shared gate mutex is poisoned.
+    LockPoisoned,
 }
 
 impl fmt::Display for DurableOpenGateError {
@@ -92,6 +99,8 @@ impl fmt::Display for DurableOpenGateError {
             Self::Heed(err) => write!(f, "durable open gate LMDB error: {err}"),
             Self::Encode(err) => write!(f, "durable open gate encode error: {err}"),
             Self::Decode(err) => write!(f, "durable open gate decode error: {err}"),
+            Self::AlreadyLocked => write!(f, "durable open gate already locked"),
+            Self::LockPoisoned => write!(f, "durable open gate lock poisoned"),
         }
     }
 }
@@ -118,13 +127,38 @@ struct OpenGateRecordV1 {
     window_ms: u64,
 }
 
+struct FileLock {
+    _file: File,
+}
+
+impl FileLock {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        let lock_path = path.join(".open_gate.lock");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        file.try_lock_exclusive()?;
+        Ok(Self { _file: file })
+    }
+}
+
 /// Durable LMDB-backed gate that enforces at-most-one open grant per configured window.
 pub struct DurableOpenGate {
+    _file_lock: FileLock,
     env: Env,
     db: Database<Str, Bytes>,
     cfg: DurableOpenGateConfig,
     cached_lock_until_ms: u64,
     stats: OpenGateStats,
+}
+
+/// Shared wrapper with fail-closed lock contention behavior.
+#[derive(Clone, Debug)]
+pub struct SharedDurableOpenGate {
+    inner: Arc<Mutex<DurableOpenGate>>,
 }
 
 impl fmt::Debug for DurableOpenGate {
@@ -143,6 +177,14 @@ impl DurableOpenGate {
         path: impl AsRef<Path>,
         cfg: DurableOpenGateConfig,
     ) -> Result<Self, DurableOpenGateError> {
+        let file_lock = FileLock::acquire(path.as_ref()).map_err(|err| {
+            if err.kind() == io::ErrorKind::WouldBlock {
+                DurableOpenGateError::AlreadyLocked
+            } else {
+                DurableOpenGateError::Io(err)
+            }
+        })?;
+
         if cfg.window.is_zero() {
             return Err(DurableOpenGateError::InvalidConfig(
                 "window must be non-zero".to_string(),
@@ -169,6 +211,7 @@ impl DurableOpenGate {
         wtxn.commit()?;
 
         let mut gate = Self {
+            _file_lock: file_lock,
             env,
             db,
             cfg,
@@ -307,6 +350,47 @@ impl DurableOpenGate {
     }
 }
 
+impl SharedDurableOpenGate {
+    /// Opens a shared gate around a single durable gate instance.
+    pub fn open(
+        path: impl AsRef<Path>,
+        cfg: DurableOpenGateConfig,
+    ) -> Result<Self, DurableOpenGateError> {
+        DurableOpenGate::open(path, cfg).map(Self::new)
+    }
+
+    /// Wraps an existing durable gate.
+    pub fn new(inner: DurableOpenGate) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    /// Attempts acquire and fails closed on lock contention.
+    pub fn try_acquire_open_fail_closed(
+        &self,
+        now: Duration,
+    ) -> Result<OpenGateDecision, DurableOpenGateError> {
+        match self.inner.try_lock() {
+            Ok(mut guard) => guard.try_acquire_open(now),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(OpenGateDecision::Blocked {
+                lock_until: now,
+            }),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(DurableOpenGateError::LockPoisoned),
+        }
+    }
+
+    /// Returns stats if lock is immediately available.
+    pub fn stats(&self) -> Option<OpenGateStats> {
+        self.inner.try_lock().ok().map(|guard| guard.stats())
+    }
+
+    /// Returns the underlying shared handle for tests and integration wiring.
+    pub fn shared_inner(&self) -> Arc<Mutex<DurableOpenGate>> {
+        self.inner.clone()
+    }
+}
+
 fn duration_to_millis(value: Duration) -> u64 {
     value.as_millis().min(u128::from(u64::MAX)) as u64
 }
@@ -317,7 +401,10 @@ fn millis_to_duration(value_ms: u64) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs::File;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -483,5 +570,240 @@ mod tests {
             }
         }
         assert_eq!(allowed, 1);
+    }
+    #[test]
+    fn shared_gate_contention_fails_closed_as_blocked() {
+        use std::sync::mpsc;
+
+        let dir = temp_dir("shared-contention");
+        let shared = SharedDurableOpenGate::open(
+            &dir,
+            DurableOpenGateConfig {
+                window: Duration::from_secs(60),
+                ..DurableOpenGateConfig::default()
+            },
+        )
+        .expect("shared gate should open");
+
+        let raw = shared.shared_inner();
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let holder = thread::spawn(move || {
+            let _guard = raw.lock().expect("lock should acquire");
+            ready_tx.send(()).expect("ready send should work");
+            release_rx.recv().expect("release recv should work");
+        });
+
+        ready_rx.recv().expect("ready recv should work");
+        let decision = shared
+            .try_acquire_open_fail_closed(Duration::from_secs(5))
+            .expect("contention should fail closed as blocked");
+        assert!(matches!(decision, OpenGateDecision::Blocked { .. }));
+
+        release_tx.send(()).expect("release send should work");
+        holder.join().expect("holder thread should join");
+    }
+
+    #[test]
+    fn child_process_hold_lock_for_test() {
+        let Some(dir) = env::var_os("SRL_CHILD_LOCK_DIR") else {
+            return;
+        };
+        let Some(ready_file) = env::var_os("SRL_CHILD_READY_FILE") else {
+            return;
+        };
+        let Some(release_file) = env::var_os("SRL_CHILD_RELEASE_FILE") else {
+            return;
+        };
+        let cfg = DurableOpenGateConfig {
+            window: Duration::from_secs(60),
+            ..DurableOpenGateConfig::default()
+        };
+        let _gate = DurableOpenGate::open(PathBuf::from(dir), cfg)
+            .expect("child process should acquire durable gate");
+        File::create(PathBuf::from(ready_file)).expect("child should write ready file");
+
+        let mut waited = 0_u32;
+        while !PathBuf::from(&release_file).exists() && waited < 1_000 {
+            thread::sleep(Duration::from_millis(10));
+            waited = waited.saturating_add(1);
+        }
+        assert!(
+            PathBuf::from(release_file).exists(),
+            "release file should be observed by child"
+        );
+    }
+
+    #[test]
+    fn multi_process_lock_is_exclusive() {
+        let dir = temp_dir("multiproc");
+        let ready_file = dir.join("ready.signal");
+        let release_file = dir.join("release.signal");
+
+        let exe = env::current_exe().expect("current_exe should resolve");
+        let test_name = "durable_open_gate::tests::child_process_hold_lock_for_test";
+        let mut child = Command::new(exe)
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env("SRL_CHILD_LOCK_DIR", &dir)
+            .env("SRL_CHILD_READY_FILE", &ready_file)
+            .env("SRL_CHILD_RELEASE_FILE", &release_file)
+            .spawn()
+            .expect("child process should start");
+
+        let mut waited = 0_u32;
+        while !ready_file.exists() && waited < 1_000 {
+            thread::sleep(Duration::from_millis(10));
+            waited = waited.saturating_add(1);
+        }
+        assert!(ready_file.exists(), "child should report ready");
+
+        let second = DurableOpenGate::open(
+            &dir,
+            DurableOpenGateConfig {
+                window: Duration::from_secs(60),
+                ..DurableOpenGateConfig::default()
+            },
+        );
+        assert!(matches!(second, Err(DurableOpenGateError::AlreadyLocked)));
+
+        File::create(&release_file).expect("parent should write release file");
+        let status = child.wait().expect("child wait should succeed");
+        assert!(status.success(), "child process should exit successfully");
+    }
+
+    #[test]
+    fn long_mixed_frequency_soak_maintains_single_grant_per_window() {
+        let dir = temp_dir("soak");
+        let window_ms = 750_u64;
+        let mut gate = DurableOpenGate::open(
+            &dir,
+            DurableOpenGateConfig {
+                window: Duration::from_millis(window_ms),
+                ..DurableOpenGateConfig::default()
+            },
+        )
+        .expect("gate should open");
+
+        let mut now_ms = 0_u64;
+        let mut expected_allowed = 0_u64;
+        let mut expected_next_open_ms = 0_u64;
+        let mut observed_allowed = 0_u64;
+        let iterations = 100_000_u64;
+        for i in 0..iterations {
+            // Frequent attempts with periodic larger jumps to cross windows.
+            if i % 2_000 == 0 {
+                now_ms = now_ms.saturating_add(window_ms + 13);
+            } else {
+                let step = ((i.wrapping_mul(1103515245).wrapping_add(12345)) >> 16) % 11;
+                now_ms = now_ms.saturating_add(step);
+            }
+
+            if now_ms >= expected_next_open_ms {
+                expected_allowed = expected_allowed.saturating_add(1);
+                expected_next_open_ms = now_ms.saturating_add(window_ms);
+            }
+
+            let decision = gate
+                .try_acquire_open(Duration::from_millis(now_ms))
+                .expect("soak acquire should not fail");
+            if matches!(decision, OpenGateDecision::Allowed { .. }) {
+                observed_allowed = observed_allowed.saturating_add(1);
+            }
+        }
+
+        let stats = gate.stats();
+        assert_eq!(stats.attempts_total, iterations);
+        assert_eq!(observed_allowed, expected_allowed);
+        assert_eq!(stats.allowed_total, expected_allowed);
+        assert_eq!(stats.persist_writes_total, expected_allowed);
+        assert_eq!(
+            stats.blocked_total,
+            iterations.saturating_sub(expected_allowed)
+        );
+    }
+
+    #[test]
+    fn allows_never_exceed_theoretical_window_bound() {
+        let dir = temp_dir("bound");
+        let window_ms = 1_000_u64;
+        let mut gate = DurableOpenGate::open(
+            &dir,
+            DurableOpenGateConfig {
+                window: Duration::from_millis(window_ms),
+                ..DurableOpenGateConfig::default()
+            },
+        )
+        .expect("gate should open");
+
+        let mut first_attempt_ms = None::<u64>;
+        let mut last_attempt_ms = 0_u64;
+        let mut allowed = 0_u64;
+        for now_ms in 0_u64..=120_000_u64 {
+            if first_attempt_ms.is_none() {
+                first_attempt_ms = Some(now_ms);
+            }
+            last_attempt_ms = now_ms;
+            let decision = gate
+                .try_acquire_open(Duration::from_millis(now_ms))
+                .expect("bound acquire should not fail");
+            if matches!(decision, OpenGateDecision::Allowed { .. }) {
+                allowed = allowed.saturating_add(1);
+            }
+        }
+
+        let start_ms = first_attempt_ms.expect("first attempt should exist");
+        let span_ms = last_attempt_ms.saturating_sub(start_ms);
+        let max_theoretical = span_ms / window_ms + 1;
+        assert!(
+            allowed <= max_theoretical,
+            "allowed={} must be <= max_theoretical={}",
+            allowed,
+            max_theoretical
+        );
+    }
+
+    #[test]
+    fn restart_under_heavy_traffic_preserves_lock_state_and_limits_writes() {
+        let dir = temp_dir("restart-traffic");
+        let window_ms = 1_000_u64;
+        let cfg = DurableOpenGateConfig {
+            window: Duration::from_millis(window_ms),
+            ..DurableOpenGateConfig::default()
+        };
+
+        let mut now_ms = 0_u64;
+        let mut expected_allowed = 0_u64;
+        let mut expected_next_open_ms = 0_u64;
+        let mut observed_allowed = 0_u64;
+        let mut aggregate_attempts = 0_u64;
+        let mut aggregate_writes = 0_u64;
+
+        for _cycle in 0..50_u64 {
+            let mut gate = DurableOpenGate::open(&dir, cfg.clone()).expect("gate should open");
+            for _ in 0..200_u64 {
+                if now_ms >= expected_next_open_ms {
+                    expected_allowed = expected_allowed.saturating_add(1);
+                    expected_next_open_ms = now_ms.saturating_add(window_ms);
+                }
+                let decision = gate
+                    .try_acquire_open(Duration::from_millis(now_ms))
+                    .expect("restart traffic acquire should not fail");
+                if matches!(decision, OpenGateDecision::Allowed { .. }) {
+                    observed_allowed = observed_allowed.saturating_add(1);
+                }
+                now_ms = now_ms.saturating_add(10);
+            }
+            let stats = gate.stats();
+            aggregate_attempts = aggregate_attempts.saturating_add(stats.attempts_total);
+            aggregate_writes = aggregate_writes.saturating_add(stats.persist_writes_total);
+            drop(gate);
+        }
+
+        assert_eq!(aggregate_attempts, 10_000);
+        assert_eq!(observed_allowed, expected_allowed);
+        assert_eq!(aggregate_writes, expected_allowed);
     }
 }

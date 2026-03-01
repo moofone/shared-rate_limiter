@@ -11,6 +11,7 @@ readme = "README.md"
 [dependencies]
 ahash = { version = "0.8.11", optional = true }
 heed = "0.20"
+fs2 = "0.4"
 rkyv = { version = "0.8", features = ["std", "bytecheck"] }
 
 [dev-dependencies]

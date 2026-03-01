@@ -127,6 +127,7 @@ pub use types::{Cost, Deny, Key, Outcome, Permit, Scope};
 
 pub use durable_open_gate::{
     DurableOpenGate, DurableOpenGateConfig, DurableOpenGateError, OpenGateDecision, OpenGateStats,
+    SharedDurableOpenGate,
 };
 pub use in_flight::{
     BeginResult, InFlightTable, LimiterInFlight, LimiterInFlightExpiryPolicy, PayloadMismatch,
