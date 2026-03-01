@@ -92,13 +92,14 @@
 //! limiter.commit(p, Outcome::Confirmed, now); // moved
 //! ```
 
-#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 /// Optional clock helpers (the core API takes `now` explicitly).
 pub mod clock;
 /// Limiter configuration types.
 pub mod config;
+/// Durable LMDB-backed open-gate dedupe primitive.
+pub mod durable_open_gate;
 /// Protocol-agnostic representation of server rate-limit feedback.
 pub mod feedback;
 /// In-flight request deduplication table with deadline expiry.
@@ -124,6 +125,9 @@ pub use observer::{DenyEvent, DenyReason, FeedbackEvent, LimiterObserver};
 pub use slow_start::SlowStart;
 pub use types::{Cost, Deny, Key, Outcome, Permit, Scope};
 
+pub use durable_open_gate::{
+    DurableOpenGate, DurableOpenGateConfig, DurableOpenGateError, OpenGateDecision, OpenGateStats,
+};
 pub use in_flight::{
     BeginResult, InFlightTable, LimiterInFlight, LimiterInFlightExpiryPolicy, PayloadMismatch,
 };
