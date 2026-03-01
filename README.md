@@ -9,8 +9,8 @@
 - Optional slow start ramp (`SlowStart`) and deterministic runtime config updates (`update_config`).
 - Bounded memory for key tracking + overflow policies (`DenyNewKey`, `EvictOldestKey`).
 - In-flight dedup building blocks: `InFlightTable`, `LimiterInFlight`.
+- Durable LMDB-backed open-gate primitive (`DurableOpenGate`) for at-most-one grant per window with crash recovery.
 - Observability hooks: `LimiterObserver` (deny + feedback events).
-- Optional `kameo` integration behind a feature flag (`--features kameo`).
 
 ## Non-goals
 

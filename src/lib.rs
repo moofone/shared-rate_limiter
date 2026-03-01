@@ -30,7 +30,7 @@
 //! - optional `bucket_remap` (route key -> bucket id)
 //!
 //! # In-flight deduplication
-//! For kameo delegated-reply style integrations, use [`InFlightTable`] to deduplicate duplicate request ids
+//! For delegated-reply style integrations, use [`InFlightTable`] to deduplicate duplicate request ids
 //! while an initial attempt is in-flight, and [`LimiterInFlight`] to carry permits through completion/expiry.
 //!
 //! # Token Bucket (Deribit-like Credit Pool)
@@ -131,7 +131,3 @@ pub use durable_open_gate::{
 pub use in_flight::{
     BeginResult, InFlightTable, LimiterInFlight, LimiterInFlightExpiryPolicy, PayloadMismatch,
 };
-
-/// Optional kameo actor wrapper (feature-gated).
-#[cfg(feature = "kameo")]
-pub mod kameo_actor;
