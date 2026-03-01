@@ -11,6 +11,8 @@ readme = "README.md"
 [dependencies]
 kameo = { git = "https://github.com/moofone/kameo", features = ["remote"], optional = true }
 ahash = { version = "0.8.11", optional = true }
+heed = "0.20"
+rkyv = { version = "0.8", features = ["std", "bytecheck"] }
 
 [dev-dependencies]
 tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread", "time"] }
